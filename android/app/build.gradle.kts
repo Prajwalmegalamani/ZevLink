@@ -14,8 +14,23 @@ android {
         versionName = "3.1.1"
     }
 
+    val localKeystore = file(System.getProperty("user.home") + "/.zevlink-signing/zevlink.jks")
+    if (localKeystore.exists()) {
+        signingConfigs {
+            create("local") {
+                storeFile = localKeystore
+                storePassword = "zevlink-local"
+                keyAlias = "zevlink"
+                keyPassword = "zevlink-local"
+            }
+        }
+    }
+
     buildTypes {
         release {
+            if (localKeystore.exists()) {
+                signingConfig = signingConfigs.getByName("local")
+            }
             isMinifyEnabled = false
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
