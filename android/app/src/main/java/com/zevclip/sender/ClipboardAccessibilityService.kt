@@ -52,6 +52,7 @@ class ClipboardAccessibilityService : AccessibilityService() {
     private var longPressedText: String? = null
     private var longPressedTextAt = 0L
     private var clipboardListenerRegistered = false
+    private var focusOverlayView: android.view.View? = null
     private var lastAirPlayVolumeToastAt = 0L
     private var zevPlayTextState: ZevPlayTextState? = null
     private var zevPlayTouchStroke: GestureDescription.StrokeDescription? = null
@@ -131,6 +132,10 @@ class ClipboardAccessibilityService : AccessibilityService() {
                 "package=${event.packageName} candidate=$matchingCandidate " +
                 "uiVisible=${ZevClipApplication.isUiVisible(application)}"
         )
+
+        // Android 10+ denies clipboard reads to background apps, so capture the
+        // live selection now: by the time the delayed read runs the selection is gone.
+        harvestSelectionFromTree()
 
         scheduleClipboardReadAfterCopy()
     }
@@ -950,6 +955,32 @@ class ClipboardAccessibilityService : AccessibilityService() {
         Log.d(TAG, "Remembered selected text (${text.length} characters)")
     }
 
+    private fun harvestSelectionFromTree() {
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return
+        val harvested = runCatching { findSelectedText(root, 0) }.getOrNull()
+        if (harvested.isNullOrBlank()) {
+            return
+        }
+
+        selectedText = harvested
+        selectedTextAt = SystemClock.elapsedRealtime()
+        Log.d(TAG, "Harvested live selection from node tree (${harvested.length} characters)")
+    }
+
+    private fun findSelectedText(node: AccessibilityNodeInfo, depth: Int): String? {
+        if (depth > MAX_SELECTION_SCAN_DEPTH) return null
+
+        selectedRange(node.text, node.textSelectionStart, node.textSelectionEnd)?.let { return it }
+
+        for (index in 0 until node.childCount) {
+            val child = node.getChild(index) ?: continue
+            val found = findSelectedText(child, depth + 1)
+            if (found != null) return found
+        }
+
+        return null
+    }
+
     private fun selectedRange(text: CharSequence?, start: Int, end: Int): String? {
         if (text == null || start < 0 || end <= start || end > text.length) {
             return null
@@ -973,11 +1004,84 @@ class ClipboardAccessibilityService : AccessibilityService() {
                 if (!sent && attempt < COPY_READ_DELAYS_MS.lastIndex) {
                     scheduleClipboardReadAfterCopy(attempt + 1)
                 } else if (!sent) {
-                    sendTrustedAccessibilityFallback()
+                    readClipboardViaFocusOverlay()
                 }
             },
             delay
         )
+    }
+
+    /**
+     * Android 10+ only lets the focused app read the clipboard. An accessibility
+     * service may add a TYPE_ACCESSIBILITY_OVERLAY window without any extra
+     * permission; making it focusable briefly gives this app clipboard access.
+     */
+    private fun readClipboardViaFocusOverlay() {
+        if (focusOverlayView != null) return
+        val windowManager = getSystemService(android.view.WindowManager::class.java) ?: return
+
+        val overlay = android.view.View(this)
+        val params = android.view.WindowManager.LayoutParams(
+            1,
+            1,
+            android.view.WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                android.view.WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+            android.graphics.PixelFormat.TRANSLUCENT
+        ).apply {
+            gravity = android.view.Gravity.TOP or android.view.Gravity.START
+        }
+
+        var finished = false
+        val finish: (String?) -> Unit = { text ->
+            if (!finished) {
+                finished = true
+                focusOverlayView = null
+                runCatching { windowManager.removeView(overlay) }
+                if (text.isNullOrBlank()) {
+                    Log.i(TAG, "Focus-overlay clipboard read found no text; trying remembered selection")
+                    sendTrustedAccessibilityFallback()
+                } else {
+                    Log.i(TAG, "Focus-overlay clipboard read succeeded (${text.length} characters)")
+                    sendAndRememberOutbound(text)
+                }
+            }
+        }
+
+        overlay.viewTreeObserver.addOnWindowFocusChangeListener(
+            object : android.view.ViewTreeObserver.OnWindowFocusChangeListener {
+                override fun onWindowFocusChanged(hasFocus: Boolean) {
+                    if (!hasFocus) return
+                    overlay.viewTreeObserver.removeOnWindowFocusChangeListener(this)
+                    handler.postDelayed({ finish(readClipboardTextQuietly()) }, FOCUS_OVERLAY_READ_DELAY_MS)
+                }
+            }
+        )
+
+        val added = runCatching {
+            windowManager.addView(overlay, params)
+        }.onFailure { error ->
+            Log.w(TAG, "Could not add focus overlay for clipboard read", error)
+        }.isSuccess
+
+        if (!added) {
+            finish(null)
+            return
+        }
+
+        focusOverlayView = overlay
+        handler.postDelayed({ finish(readClipboardTextQuietly()) }, FOCUS_OVERLAY_TIMEOUT_MS)
+    }
+
+    private fun readClipboardTextQuietly(): String? {
+        return runCatching {
+            getSystemService(ClipboardManager::class.java).primaryClip
+                ?.takeIf { it.itemCount > 0 && it.description.hasMimeType("text/*") }
+                ?.getItemAt(0)
+                ?.coerceToText(this)
+                ?.toString()
+                ?.takeIf { it.isNotBlank() }
+        }.getOrNull()
     }
 
     private fun readClipboardAndSend(): Boolean {
@@ -1197,6 +1301,9 @@ class ClipboardAccessibilityService : AccessibilityService() {
         const val ZEVPLAY_ZOOM_DIAGONAL = 0.70710677f
         const val MIN_TRUSTED_FALLBACK_LENGTH = 3
         const val MAX_TRUSTED_FALLBACK_LENGTH = 20_000
+        const val MAX_SELECTION_SCAN_DEPTH = 25
+        const val FOCUS_OVERLAY_READ_DELAY_MS = 60L
+        const val FOCUS_OVERLAY_TIMEOUT_MS = 900L
 
         val COPY_READ_DELAYS_MS = longArrayOf(90L, 220L)
         val TRUSTED_PUNCTUATION = setOf('.', ',', '?', '!', ':', ';', '-', '_', '/', '@', '#')

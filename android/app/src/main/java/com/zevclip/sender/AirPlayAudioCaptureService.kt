@@ -82,7 +82,11 @@ class AirPlayAudioCaptureService : Service() {
         }
 
         Log.i(TAG, "Starting ZevLink audio capture; enabling local playback silencer.")
-        localPlaybackSilencer = LocalPlaybackSilencer(this).also { it.start() }
+        localPlaybackSilencer = runCatching {
+            LocalPlaybackSilencer(this).also { it.start() }
+        }.onFailure { error ->
+            Log.w(TAG, "Local playback silencer unavailable; streaming without it", error)
+        }.getOrNull()
         running.set(true)
         ZevClipPreferences.setAirPlayStreaming(this, true)
         ZevClipPreferences.setAirPlayTestStatus(this, getString(R.string.airplay_streaming_connecting))

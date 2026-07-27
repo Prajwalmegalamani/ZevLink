@@ -28,7 +28,13 @@ class LocalPlaybackSilencer(context: Context) : Closeable {
     private val originalVolume = audioManager.getStreamVolume(AudioManager.STREAM_MUSIC)
     private val originallyMuted = audioManager.isStreamMute(AudioManager.STREAM_MUSIC)
     private val mediaVolumeGroupId = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-        audioManager.getVolumeGroupIdForAttributes(mediaAttributes)
+        // Some OEM builds (Samsung One UI) gate the volume-group lookup behind
+        // privileged audio permissions and throw SecurityException.
+        runCatching { audioManager.getVolumeGroupIdForAttributes(mediaAttributes) }
+            .onFailure { error ->
+                Log.w(TAG, "Volume group lookup unavailable; using stream mute only", error)
+            }
+            .getOrNull()
     } else {
         null
     }
